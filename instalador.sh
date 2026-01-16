@@ -1,292 +1,193 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 # ============================================================
-# INSTALADOR COMPLETO - emendas.anaidison.com.br (Vite/React)
-# - Instala Nginx + Node 20 + Certbot
-# - Coloca o projeto em /var/www/emendas-app
-# - Gera .env (Supabase)
-# - Build (npm install + npm run build)
-# - Configura Nginx (SPA fallback)
-# - Emite SSL (Let's Encrypt) se o DNS já estiver apontado
-#
-# COMO USAR:
-# 1) Suba seu projeto para a VPS de um destes jeitos:
-#    A) Via GIT (recomendado): você informa o REPO_URL na execução
-#    B) Via ZIP local: você informa o caminho do zip na VPS (ex: /root/meuprojeto.zip)
-#    C) Se o projeto já está na máquina (pasta com package.json), você informa o caminho da pasta
-#
-# 2) Rode:
-#    chmod +x install_emendas.sh && ./install_emendas.sh
+# INSTALADOR AUTOMÁTICO – emendas.anaidison.com.br
+# Ubuntu 22/24 | Vite + React | Nginx | SSL
 # ============================================================
 
 DOMAIN="emendas.anaidison.com.br"
-WEB_ROOT_BASE="/var/www/emendas-app"
-CERTBOT_EMAIL="seuemail@exemplo.com"     # <-- TROQUE (recomendado)
-ENABLE_SSL="yes"                         # yes | no
+WEB_ROOT="/var/www/emendas"
+BUILD_DIR="dist"
 
-# Supabase (o PROJECT_ID e URL você já tem; a ANON KEY o script vai perguntar)
+# Supabase (fixos)
 VITE_SUPABASE_PROJECT_ID="mimatrpfmfjvwphnvrht"
 VITE_SUPABASE_URL="https://mimatrpfmfjvwphnvrht.supabase.co"
 
-# Build do Vite
-BUILD_DIR_NAME="dist"
+CERTBOT_EMAIL="vivianribeiro14@gmail.com"
 
-# --------- helpers ----------
-info() { echo -e "\n[INFO] $*\n"; }
-warn() { echo -e "\n[AVISO] $*\n"; }
-die()  { echo -e "\n[ERRO] $*\n"; exit 1; }
+# ============================================================
+# FUNÇÕES
+# ============================================================
 
-need_sudo() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-      SUDO="sudo"
-    else
-      die "Precisa rodar como root ou ter sudo instalado."
-    fi
+info() { echo -e "\n\033[1;32m[INFO]\033[0m $1\n"; }
+warn() { echo -e "\n\033[1;33m[AVISO]\033[0m $1\n"; }
+error() { echo -e "\n\033[1;31m[ERRO]\033[0m $1\n"; exit 1; }
+
+# root ou sudo
+if [ "$EUID" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
   else
-    SUDO=""
+    error "Execute como root ou instale sudo."
   fi
-}
+else
+  SUDO=""
+fi
 
-ask() {
-  local prompt="$1"
-  local default="${2:-}"
-  local var
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " var
-    echo "${var:-$default}"
-  else
-    read -r -p "$prompt: " var
-    echo "$var"
-  fi
-}
+# ============================================================
+# SISTEMA
+# ============================================================
 
-install_system() {
-  info "Instalando dependências do sistema..."
-  $SUDO apt update -y
-  $SUDO apt install -y nginx curl git unzip ca-certificates
+info "Atualizando sistema e instalando dependências..."
+$SUDO apt update -y
+$SUDO apt install -y curl git unzip nginx ca-certificates
 
-  if ! command -v node >/dev/null 2>&1; then
-    info "Instalando Node.js 20 (NodeSource)..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash -
-    $SUDO apt install -y nodejs
-  fi
+# Node.js 20
+if ! command -v node >/dev/null 2>&1; then
+  info "Instalando Node.js 20..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO bash -
+  $SUDO apt install -y nodejs
+fi
 
-  info "Versões: node=$(node -v) | npm=$(npm -v) | nginx=$(nginx -v 2>&1)"
-}
+info "Versões:"
+node -v
+npm -v
+nginx -v
 
-ensure_dirs() {
-  info "Criando pasta base do site: ${WEB_ROOT_BASE}"
-  $SUDO mkdir -p "${WEB_ROOT_BASE}"
-  $SUDO chown -R "$USER:$USER" "${WEB_ROOT_BASE}"
-}
+# ============================================================
+# PROJETO
+# ============================================================
 
-choose_source() {
-  echo ""
-  echo "Como seu projeto está aí na VPS?"
-  echo "1) Já existe uma PASTA com package.json"
-  echo "2) Tenho um ZIP na VPS e quero extrair"
-  echo "3) Quero clonar pelo GIT"
-  echo ""
-  local opt
-  opt="$(ask 'Escolha 1/2/3' '1')"
+info "Preparando diretório do projeto..."
+$SUDO mkdir -p $WEB_ROOT
+$SUDO chown -R $USER:$USER $WEB_ROOT
 
-  case "$opt" in
-    1)
-      PROJECT_DIR="$(ask 'Digite o caminho da pasta do projeto (onde tem package.json)' "${WEB_ROOT_BASE}")"
-      ;;
-    2)
-      local zip_path
-      zip_path="$(ask 'Digite o caminho do ZIP na VPS (ex: /root/projeto.zip)')"
-      [[ -f "$zip_path" ]] || die "ZIP não encontrado em: $zip_path"
+echo ""
+echo "Como você quer fornecer o projeto?"
+echo "1) ZIP já está na VPS"
+echo "2) Clonar repositório Git"
+echo "3) Projeto já está em uma pasta"
+read -p "Escolha [1/2/3]: " SOURCE_OPTION
 
-      # limpa pasta base e extrai
-      info "Extraindo ZIP para ${WEB_ROOT_BASE}..."
-      rm -rf "${WEB_ROOT_BASE:?}/"*
-      unzip -q "$zip_path" -d "${WEB_ROOT_BASE}"
+if [ "$SOURCE_OPTION" = "1" ]; then
+  read -p "Caminho do ZIP (ex: /root/projeto.zip): " ZIP_PATH
+  [ -f "$ZIP_PATH" ] || error "ZIP não encontrado."
+  rm -rf $WEB_ROOT/*
+  unzip -q "$ZIP_PATH" -d $WEB_ROOT
+elif [ "$SOURCE_OPTION" = "2" ]; then
+  read -p "URL do repositório Git: " GIT_URL
+  rm -rf $WEB_ROOT/*
+  git clone "$GIT_URL" $WEB_ROOT
+elif [ "$SOURCE_OPTION" = "3" ]; then
+  read -p "Caminho da pasta do projeto: " PROJECT_DIR
+  [ -f "$PROJECT_DIR/package.json" ] || error "package.json não encontrado."
+  WEB_ROOT="$PROJECT_DIR"
+else
+  error "Opção inválida."
+fi
 
-      # tenta achar a pasta do projeto (primeira com package.json)
-      PROJECT_DIR="$(find "${WEB_ROOT_BASE}" -maxdepth 3 -type f -name package.json -print -quit | xargs -r dirname || true)"
-      [[ -n "${PROJECT_DIR}" ]] || die "Não achei package.json após extrair. Verifique o ZIP."
-      ;;
-    3)
-      local repo_url
-      repo_url="$(ask 'Cole o URL do repositório (https/ssh)')"
-      [[ -n "$repo_url" ]] || die "Repo URL vazio."
+# localizar package.json
+if [ ! -f "$WEB_ROOT/package.json" ]; then
+  PROJECT_DIR=$(find "$WEB_ROOT" -maxdepth 3 -name package.json | head -n 1 | xargs dirname)
+else
+  PROJECT_DIR="$WEB_ROOT"
+fi
 
-      info "Clonando repositório para ${WEB_ROOT_BASE}..."
-      rm -rf "${WEB_ROOT_BASE:?}/"*
-      git clone "$repo_url" "${WEB_ROOT_BASE}"
+[ -f "$PROJECT_DIR/package.json" ] || error "package.json não encontrado."
 
-      # se clonou dentro da base, define dir
-      PROJECT_DIR="${WEB_ROOT_BASE}"
-      # se o package.json estiver em subpasta, tenta localizar
-      if [[ ! -f "${PROJECT_DIR}/package.json" ]]; then
-        PROJECT_DIR="$(find "${WEB_ROOT_BASE}" -maxdepth 3 -type f -name package.json -print -quit | xargs -r dirname || true)"
-      fi
-      [[ -f "${PROJECT_DIR}/package.json" ]] || die "Não achei package.json no repositório."
-      ;;
-    *)
-      die "Opção inválida."
-      ;;
-  esac
+info "Projeto localizado em: $PROJECT_DIR"
 
-  info "Projeto detectado em: ${PROJECT_DIR}"
-  [[ -f "${PROJECT_DIR}/package.json" ]] || die "package.json não encontrado em: ${PROJECT_DIR}"
-}
+# ============================================================
+# ENV
+# ============================================================
 
-write_env() {
-  info "Configurando .env do Vite (Supabase)..."
+echo ""
+echo "Cole a SUPABASE ANON KEY (não aparece ao digitar):"
+read -s SUPABASE_KEY
+echo ""
 
-  # Lê a anon key sem mostrar na tela
-  echo ""
-  echo "Cole agora a SUPABASE ANON KEY (publishable)."
-  echo "Ela fica no Supabase: Project Settings > API > anon public."
-  read -r -s -p "SUPABASE_ANON_KEY: " SUPABASE_ANON_KEY
-  echo ""
+[ -n "$SUPABASE_KEY" ] || error "Anon key vazia."
 
-  [[ -n "${SUPABASE_ANON_KEY}" ]] || die "Você não informou a anon key."
-
-  cat > "${PROJECT_DIR}/.env" <<EOF
-VITE_SUPABASE_PROJECT_ID="${VITE_SUPABASE_PROJECT_ID}"
-VITE_SUPABASE_PUBLISHABLE_KEY="${SUPABASE_ANON_KEY}"
-VITE_SUPABASE_URL="${VITE_SUPABASE_URL}"
+cat > "$PROJECT_DIR/.env" <<EOF
+VITE_SUPABASE_PROJECT_ID="$VITE_SUPABASE_PROJECT_ID"
+VITE_SUPABASE_PUBLISHABLE_KEY="$SUPABASE_KEY"
+VITE_SUPABASE_URL="$VITE_SUPABASE_URL"
 EOF
 
-  info ".env criado em ${PROJECT_DIR}/.env"
-}
+info ".env criado com sucesso"
 
-build_project() {
-  info "Instalando dependências do projeto e gerando build..."
-  cd "${PROJECT_DIR}"
-  npm install
-  npm run build
+# ============================================================
+# BUILD
+# ============================================================
 
-  [[ -d "${PROJECT_DIR}/${BUILD_DIR_NAME}" ]] || die "Build não gerou ${BUILD_DIR_NAME}. Verifique seu Vite config."
-  info "Build OK: ${PROJECT_DIR}/${BUILD_DIR_NAME}"
-}
+info "Instalando dependências e gerando build..."
+cd "$PROJECT_DIR"
+npm install
+npm run build
 
-configure_nginx() {
-  info "Configurando Nginx para ${DOMAIN}..."
+[ -d "$PROJECT_DIR/$BUILD_DIR" ] || error "Build não gerou $BUILD_DIR."
 
-  local site_avail="/etc/nginx/sites-available/${DOMAIN}"
-  local site_enabled="/etc/nginx/sites-enabled/${DOMAIN}"
-  local root_path="${PROJECT_DIR}/${BUILD_DIR_NAME}"
+# ============================================================
+# NGINX
+# ============================================================
 
-  # remove default se existir
-  if [[ -f "/etc/nginx/sites-enabled/default" ]]; then
-    $SUDO rm -f /etc/nginx/sites-enabled/default || true
-  fi
+info "Configurando Nginx..."
 
-  $SUDO tee "${site_avail}" >/dev/null <<EOF
+NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
+
+$SUDO tee "$NGINX_CONF" >/dev/null <<EOF
 server {
   listen 80;
-  server_name ${DOMAIN};
+  server_name $DOMAIN;
 
-  root ${root_path};
+  root $PROJECT_DIR/$BUILD_DIR;
   index index.html;
 
-  # SPA fallback (React Router)
   location / {
     try_files \$uri \$uri/ /index.html;
   }
 
-  # Cache de estáticos
   location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
     expires 7d;
     add_header Cache-Control "public, max-age=604800";
-    try_files \$uri =404;
   }
 }
 EOF
 
-  if [[ ! -L "${site_enabled}" ]]; then
-    $SUDO ln -s "${site_avail}" "${site_enabled}"
-  fi
+$SUDO rm -f /etc/nginx/sites-enabled/default
+$SUDO ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
 
-  $SUDO nginx -t
-  $SUDO systemctl enable nginx
-  $SUDO systemctl reload nginx
+$SUDO nginx -t
+$SUDO systemctl reload nginx
 
-  info "Nginx OK. Teste (HTTP): http://${DOMAIN}"
-}
+# ============================================================
+# SSL
+# ============================================================
 
-open_firewall_if_any() {
-  # Não força UFW (nem todo servidor usa), mas tenta ajudar se existir
-  if command -v ufw >/dev/null 2>&1; then
-    info "UFW detectado. Liberando portas 80 e 443 (se UFW estiver ativo)..."
-    $SUDO ufw allow 80/tcp || true
-    $SUDO ufw allow 443/tcp || true
-  fi
-}
+info "Instalando SSL (Let's Encrypt)..."
+$SUDO apt install -y certbot python3-certbot-nginx
 
-configure_ssl() {
-  if [[ "${ENABLE_SSL}" != "yes" ]]; then
-    warn "SSL desativado (ENABLE_SSL=no). Pulando Certbot."
-    return 0
-  fi
+$SUDO certbot --nginx \
+  -d $DOMAIN \
+  --non-interactive \
+  --agree-tos \
+  -m $CERTBOT_EMAIL || warn "SSL não emitido (DNS pode não estar propagado)"
 
-  info "Instalando Certbot e tentando emitir SSL..."
-  $SUDO apt install -y certbot python3-certbot-nginx
+# ============================================================
+# FINAL
+# ============================================================
 
-  if [[ "${CERTBOT_EMAIL}" == "seuemail@exemplo.com" ]]; then
-    warn "Você não trocou CERTBOT_EMAIL. Vou continuar sem email (menos recomendado)."
-    $SUDO certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email || {
-      warn "Falhou emitir SSL. Causas comuns:"
-      warn "- DNS do subdomínio ainda não aponta para esta VPS"
-      warn "- Porta 80 bloqueada no firewall/provedor"
-      warn "- Domínio não resolve corretamente"
-      return 0
-    }
-  else
-    $SUDO certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${CERTBOT_EMAIL}" || {
-      warn "Falhou emitir SSL. Causas comuns:"
-      warn "- DNS do subdomínio ainda não aponta para esta VPS"
-      warn "- Porta 80 bloqueada no firewall/provedor"
-      warn "- Domínio não resolve corretamente"
-      return 0
-    }
-  fi
-
-  info "SSL OK. Teste (HTTPS): https://${DOMAIN}"
-}
-
-final_notes() {
-  cat <<EOF
-
-==============================
-INSTALAÇÃO FINALIZADA ✅
-==============================
-
-Domínio:      ${DOMAIN}
-Projeto:      ${PROJECT_DIR}
-Build:        ${PROJECT_DIR}/${BUILD_DIR_NAME}
-
-Atualizar depois (quando mudar o projeto):
-  cd "${PROJECT_DIR}"
-  git pull   # se estiver usando git
-  npm install
-  npm run build
-  sudo systemctl reload nginx
-
-Se o SSL falhou:
-- Confira se o A record "emendas" aponta para o IP da VPS
-- Aguarde propagação do DNS
-- Depois rode:
-  sudo certbot --nginx -d ${DOMAIN}
-
-EOF
-}
-
-# --------- main ----------
-need_sudo
-install_system
-ensure_dirs
-choose_source
-write_env
-build_project
-configure_nginx
-open_firewall_if_any
-configure_ssl
-final_notes
+echo ""
+echo "======================================"
+echo " INSTALAÇÃO FINALIZADA COM SUCESSO ✅"
+echo "======================================"
+echo ""
+echo "🌐 Site: https://$DOMAIN"
+echo "📁 Projeto: $PROJECT_DIR"
+echo ""
+echo "Para atualizar no futuro:"
+echo "cd $PROJECT_DIR"
+echo "npm install && npm run build"
+echo "sudo systemctl reload nginx"
+echo ""
