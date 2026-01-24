@@ -14,7 +14,7 @@ BUILD_DIR="dist"
 VITE_SUPABASE_PROJECT_ID="mimatrpfmfjvwphnvrht"
 VITE_SUPABASE_URL="https://mimatrpfmfjvwphnvrht.supabase.co"
 
-CERTBOT_EMAIL="vivianribeiro14@gmail.com"
+CERTBOT_EMAIL="anaidison@gmail.com"
 
 # ============================================================
 # FUNÇÕES
